@@ -1,0 +1,1239 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<script>
+/* 所有可調參數都在這裡，說明見 NOTES.md。單位：像素是「低解析度畫面」的像素，時間是秒。 */
+const CONFIG = {
+  view: { width: 320, height: 180, integerScaleFrom: 2 }, // 放大倍率 >= integerScaleFrom 時取整數倍
+  roundSeconds: 60,
+
+  room: {
+    floorY: 160,
+    shelves: [
+      { x0: 28, x1: 112, y: 118, level: 1 },
+      { x0: 208, x1: 292, y: 118, level: 1 },
+      { x0: 120, x1: 200, y: 78, level: 2 },
+    ],
+  },
+
+  cat: {
+    runSpeed: 132,
+    groundAccel: 1400,
+    airAccel: 900,
+    friction: 1600,
+    jumpSpeed: 305,
+    gravity: 840,
+    jumpCut: 0.5,       // 提早放開跳躍鍵時，上升速度乘上這個值
+    maxFallSpeed: 380,
+    coyoteSeconds: 0.08,
+    jumpBufferSeconds: 0.1,
+    hitboxHalfWidth: 5,
+    hitboxHeight: 12,
+  },
+
+  hide: {
+    enterSeconds: 0.16,      // 縮進箱子
+    hideSeconds: 0.34,       // 只露耳朵
+    squishHideSeconds: 0.46, // 硬塞成一團
+    shakeSeconds: 0.22,      // 箱子抖動
+    popSpeed: 175,           // 跳出箱子的初速
+  },
+
+  spawn: {
+    firstDelay: 0.4,
+    intervalStart: 1.35, // 開局的出箱間隔
+    intervalEnd: 0.45,   // 結束前的出箱間隔
+    lifetimeStart: 5.0,  // 開局的箱子壽命
+    lifetimeEnd: 2.2,    // 結束前的箱子壽命
+    curve: 1.2,          // 1 = 線性；越大越晚才變難
+    jitter: 0.15,        // 間隔隨機 ±15%
+    maxBoxes: 7,
+    gap: 6,              // 箱子之間的最小間距
+    minCatDistance: 26,  // 不會直接生在貓身上
+    warnSeconds: 0.7,    // 剩這麼久時箱子開始發抖
+  },
+
+  // 箱子種類。squish: true = 太小，貓會硬塞成一團。
+  boxes: [
+    { name: 'big',    w: 30, h: 22, weight: 4, points: 10, lifeScale: 1.0,  squish: false },
+    { name: 'medium', w: 22, h: 17, weight: 4, points: 15, lifeScale: 0.95, squish: false },
+    { name: 'tiny',   w: 12, h: 9,  weight: 2, points: 40, lifeScale: 0.8,  squish: true },
+  ],
+
+  combo: {
+    windowSeconds: 3.2, // 在這段時間內鑽到下一個箱子，combo 才會延續
+    bonusPerStep: 0.25, // 每一層 combo 增加的倍率
+    maxMultiplier: 4,
+  },
+
+  glitch: {
+    enabled: true,
+    frames: 2,       // 得分時 RGB 錯位持續幾幀
+    rgbShift: 1,     // 一般得分的錯位像素
+    bigRgbShift: 2,  // 硬塞或高 combo 的錯位像素
+    bigComboFrom: 5,
+    strength: 0.65,  // 錯位影像的混合比例，1 = 完全錯位，越低越柔和
+    bands: 2,        // 水平撕裂帶數量
+    bandShift: 3,
+  },
+
+  shake: { squishPixels: 1, squishSeconds: 0.12 },
+  scanlineAlpha: 0.05,
+  audio: { volume: 0.1 },
+  squishLines: ['硬塞！', '塞得下！', '貓是液體', '這也行？', '一團！'],
+};
+</script>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>紙箱貓</title>
+<link rel="icon" href="data:,">
+<style>
+  :root { --u: 3px; --scan-alpha: 0.05; }
+  [hidden] { display: none !important; }
+  html, body { height: 100%; margin: 0; background: #0c0b13; }
+  body {
+    display: flex; align-items: center; justify-content: center; overflow: hidden;
+    color: #ece8f4;
+    font-family: "Cascadia Mono", Consolas, "Microsoft JhengHei", "PingFang TC", "Noto Sans CJK TC", monospace;
+  }
+  #stage {
+    position: relative; overflow: hidden; touch-action: none;
+    -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent;
+  }
+  canvas {
+    display: block; width: 100%; height: 100%;
+    image-rendering: crisp-edges; image-rendering: pixelated;
+  }
+  #scanlines {
+    position: absolute; inset: 0; pointer-events: none;
+    background: repeating-linear-gradient(to bottom,
+      rgba(0, 0, 0, var(--scan-alpha)) 0, rgba(0, 0, 0, var(--scan-alpha)) 1px,
+      transparent 1px, transparent 3px);
+  }
+  #popups { position: absolute; inset: 0; pointer-events: none; overflow: hidden; }
+  .pop {
+    position: absolute; transform: translate(-50%, 0); white-space: nowrap; font-weight: 700;
+    font-size: clamp(14px, calc(var(--u) * 9), 40px); color: #ff9ecb;
+    text-shadow: 2px 2px 0 #1b1020; animation: pop-rise 0.8s steps(10) forwards;
+  }
+  @keyframes pop-rise {
+    from { opacity: 1; margin-top: 0; }
+    70% { opacity: 1; }
+    to { opacity: 0; margin-top: calc(var(--u) * -16); }
+  }
+  #overlay {
+    position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    text-align: center; background: rgba(12, 11, 19, 0.72);
+  }
+  #overlay section { padding: 8px 16px; }
+  h1, h2 { margin: 0; font-size: clamp(24px, calc(var(--u) * 20), 80px); letter-spacing: 0.08em; }
+  h1 { color: #62f3cd; text-shadow: 2px 0 0 rgba(255, 70, 120, 0.45), -2px 0 0 rgba(70, 140, 255, 0.45); }
+  h2 { font-size: clamp(14px, calc(var(--u) * 8), 32px); color: #b6afc8; font-weight: 400; }
+  p { margin: 0.4em 0; font-size: clamp(12px, calc(var(--u) * 6), 24px); line-height: 1.5; color: #c9c3d8; }
+  #final-score {
+    font-size: clamp(36px, calc(var(--u) * 26), 110px); line-height: 1.15; font-weight: 700; color: #62f3cd;
+  }
+  .action {
+    margin-top: 0.5em; padding: 0.35em 1.1em; font: inherit; font-weight: 700;
+    font-size: clamp(16px, calc(var(--u) * 9), 36px);
+    color: #14121f; background: #62f3cd; border: 0; border-radius: 2px; cursor: pointer;
+    box-shadow: 0 calc(var(--u) * 1) 0 #2a9c84;
+  }
+  .action:hover { background: #8ff8dd; }
+  .action:focus-visible, #sound:focus-visible { outline: 2px solid #ffffff; outline-offset: 2px; }
+  #sound {
+    position: absolute; right: 1.5%; bottom: 1.5%; z-index: 2; padding: 2px 8px; font: inherit;
+    font-size: clamp(11px, calc(var(--u) * 5), 18px);
+    color: #c9c3d8; background: rgba(20, 18, 31, 0.8); border: 1px solid #4a4464; border-radius: 2px; cursor: pointer;
+  }
+  #sound[aria-pressed="true"] { color: #62f3cd; border-color: #62f3cd; }
+  .touch-only { display: none; }
+  @media (pointer: coarse) { .touch-only { display: inline; } .desk-only { display: none; } }
+</style>
+</head>
+<body>
+<div id="stage">
+  <canvas id="game" aria-label="紙箱貓遊戲畫面"></canvas>
+  <div id="scanlines"></div>
+  <div id="popups"></div>
+  <button id="sound" type="button" aria-pressed="false">音效：關</button>
+  <div id="overlay">
+    <section id="title-panel">
+      <h1>紙箱貓</h1>
+      <p>在紙箱消失前鑽進去。連續鑽有 combo；<br>太小的箱子也硬塞，分數更多。</p>
+      <p class="desk-only">方向鍵 / WASD 移動・空白鍵跳・↓ / S 下層架子・M 音效</p>
+      <p class="touch-only">點畫面，貓就會跑過去</p>
+      <button id="start" class="action" type="button">開始</button>
+    </section>
+    <section id="result-panel" hidden>
+      <h2>時間到</h2>
+      <div id="final-score">0</div>
+      <p id="final-stats"></p>
+      <button id="again" class="action" type="button">再一次</button>
+    </section>
+  </div>
+</div>
+
+<script>
+'use strict';
+
+const W = CONFIG.view.width;
+const H = CONFIG.view.height;
+const STEP = 1 / 120;
+const BEST_KEY = 'cardboard-cat-best';
+
+const stage = document.getElementById('stage');
+const canvas = document.getElementById('game');
+canvas.width = W;
+canvas.height = H;
+const ctx = canvas.getContext('2d', { willReadFrequently: true });
+ctx.imageSmoothingEnabled = false;
+stage.style.setProperty('--scan-alpha', CONFIG.scanlineAlpha);
+
+const ui = {
+  overlay: document.getElementById('overlay'),
+  titlePanel: document.getElementById('title-panel'),
+  resultPanel: document.getElementById('result-panel'),
+  finalScore: document.getElementById('final-score'),
+  finalStats: document.getElementById('final-stats'),
+  popups: document.getElementById('popups'),
+  sound: document.getElementById('sound'),
+};
+
+const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+/* ---------- 小工具 ---------- */
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+const lerp = (a, b, t) => a + (b - a) * t;
+const rand = (lo, hi) => lo + Math.random() * (hi - lo);
+const approach = (v, target, delta) => (v < target ? Math.min(v + delta, target) : Math.max(v - delta, target));
+
+function makeCanvas(w, h) {
+  const c = document.createElement('canvas');
+  c.width = w;
+  c.height = h;
+  return c;
+}
+
+/* ---------- 像素貓 ---------- */
+const PALETTE = {
+  k: '#07070c', // 身體
+  r: '#5d5885', // 邊光（烘焙時自動產生，黑貓才不會融進背景）
+  g: '#3ff5c8', // 眼睛
+  p: '#c9799a', // 鼻子、耳內
+  h: '#ff8fc0', // 愛心
+};
+
+function bakeSprite(rows, flip) {
+  const w = rows[0].length;
+  const c = makeCanvas(w, rows.length);
+  const g = c.getContext('2d');
+  const at = (x, y) => (rows[y] && rows[y][x]) || '.';
+  for (let y = 0; y < rows.length; y++) {
+    for (let x = 0; x < w; x++) {
+      let ch = at(x, y);
+      if (ch === '.') continue;
+      if (ch === 'k' && (at(x, y - 1) === '.' || at(x - 1, y) === '.' || at(x + 1, y) === '.')) ch = 'r';
+      g.fillStyle = PALETTE[ch];
+      g.fillRect(flip ? w - 1 - x : x, y, 1, 1);
+    }
+  }
+  return c;
+}
+
+const CAT_TOP = [
+  '................',
+  '................',
+  '................',
+  '.........k....k.',
+  '.........kk..kk.',
+  '.........kkkkkk.',
+  '.........kgkkgk.',
+  '.........kgkkgk.',
+  '.........kkkpkk.',
+  '..kkkkkkkkkkkkk.',
+  '..kkkkkkkkkkkk..',
+  '..kkkkkkkkkkkk..',
+  '..kkkkkkkkkkkk..',
+];
+const TAIL_A = { 5: 1, 6: 1, 7: 2, 8: 2 };
+const TAIL_B = { 5: 0, 6: 0, 7: 1, 8: 2 };
+const LEGS = {
+  stand: ['...kk.kk.kk.kk..', '...kk.kk.kk.kk..', '...kk.kk.kk.kk..'],
+  walk1: ['...kk.kk.kk.kk..', '..kk...kk.kk..kk', '..k.....k.k....k'],
+  walk2: ['...kk.kk.kk.kk..', '....kkk....kkk..', '....kk.....kk...'],
+  jump: ['..kk......kkk...', '.kk.........kk..', 'k.............k.'],
+  fall: ['...kk.....kk....', '...kk.....kk....', '................'],
+};
+
+function catRows(legs, tail, blink) {
+  const rows = CAT_TOP.concat(legs).map((row, y) => {
+    let out = row;
+    if (tail[y] !== undefined) out = out.slice(0, tail[y]) + 'k' + out.slice(tail[y] + 1);
+    if (y === 6 && tail === TAIL_A) out = out.slice(0, 2) + 'k' + out.slice(3);
+    return out;
+  });
+  return blink ? rows.map((r) => r.replace(/g/g, 'k')) : rows;
+}
+
+const SIT_ROWS = [
+  '...k........k...',
+  '..kkk......kkk..',
+  '..kpk......kpk..',
+  '..kpkk....kkpk..',
+  '..kkkk....kkkk..', // 前 5 列只有耳朵，藏進箱子時只露這幾列
+  '..kkkkkkkkkkkk..',
+  '..kkgkkkkkkgkk..',
+  '..kkgkkkkkkgkk..',
+  '..kkkkkppkkkkk..',
+  '...kkkkkkkkkk...',
+  '....kkkkkkkk....',
+  '...kkkkkkkkkk...',
+  '...kkkkkkkkkkkk.',
+  '...kkkkkkkkkkk..',
+  '...kk.kk.kk.kk..',
+];
+
+const BLOB_ROWS = [
+  '...k..........k...',
+  '...kk........kk...',
+  '..kkkkkkkkkkkkkk..',
+  '.kkkkkkkkkkkkkkkk.',
+  '.kkkgkkkkkkkkgkkk.',
+  'kkkkgkkkkkkkkgkkkk',
+  'kkkkkkkkppkkkkkkkk',
+  'kkkkkkkkkkkkkkkkkk',
+  'kkkkkkkkkkkkkkkkkk',
+  '.kkkkkkkkkkkkkkkk.',
+  '..kkkkkkkkkkkkkk..',
+];
+
+const HEART_ROWS = ['.h.h.', 'hhhhh', 'hhhhh', '.hhh.', '..h..'];
+
+function bakePair(rows) {
+  return [bakeSprite(rows, false), bakeSprite(rows, true)]; // [朝右, 朝左]
+}
+
+const SPRITES = {
+  idle: bakePair(catRows(LEGS.stand, TAIL_A, false)),
+  blink: bakePair(catRows(LEGS.stand, TAIL_A, true)),
+  idle2: bakePair(catRows(LEGS.stand, TAIL_B, false)),
+  walk1: bakePair(catRows(LEGS.walk1, TAIL_A, false)),
+  walk2: bakePair(catRows(LEGS.walk2, TAIL_B, false)),
+  jump: bakePair(catRows(LEGS.jump, TAIL_B, false)),
+  fall: bakePair(catRows(LEGS.fall, TAIL_A, false)),
+  sit: bakeSprite(SIT_ROWS, false),
+  blob: bakeSprite(BLOB_ROWS, false),
+  blobBlink: bakeSprite(BLOB_ROWS.map((r) => r.replace(/g/g, 'k')), false),
+  heart: bakeSprite(HEART_ROWS, false),
+};
+
+/* ---------- 3x5 像素字（每列一個 0-7 的數字＝3 個位元） ---------- */
+const FONT = {
+  0: '75557', 1: '26227', 2: '71747', 3: '71717', 4: '55711', 5: '74717', 6: '74757', 7: '71222', 8: '75757', 9: '75717',
+  A: '25755', B: '65656', C: '34443', D: '65556', E: '74647', F: '74644', G: '34553', H: '55755', I: '72227', J: '11152',
+  K: '55655', L: '44447', M: '57755', N: '65555', O: '25552', P: '65644', Q: '25563', R: '65655', S: '34216', T: '72222',
+  U: '55557', V: '55552', W: '55775', X: '55255', Y: '55222', Z: '71247',
+  '+': '02720', '-': '00700', '!': '22202', x: '00525', ':': '02020', '.': '00002', ' ': '00000',
+};
+
+function textWidth(text, scale = 1) {
+  return text.length * 4 * scale - scale;
+}
+
+function drawText(text, x, y, color, scale = 1, shadow = '#0c0b13') {
+  if (shadow) drawGlyphs(text, x + scale, y + scale, shadow, scale);
+  drawGlyphs(text, x, y, color, scale);
+}
+
+function drawGlyphs(text, x, y, color, scale) {
+  ctx.fillStyle = color;
+  for (let i = 0; i < text.length; i++) {
+    const glyph = FONT[text[i]] || FONT[' '];
+    for (let row = 0; row < 5; row++) {
+      const bits = Number(glyph[row]);
+      for (let col = 0; col < 3; col++) {
+        if (bits & (4 >> col)) ctx.fillRect(x + (i * 4 + col) * scale, y + row * scale, scale, scale);
+      }
+    }
+  }
+}
+
+/* ---------- 房間 ---------- */
+const floorSurface = { x0: 0, x1: W, y: CONFIG.room.floorY, level: 0 };
+const surfaces = [floorSurface, ...CONFIG.room.shelves];
+
+const background = (() => {
+  const c = makeCanvas(W, H);
+  const g = c.getContext('2d');
+  const box = (color, x, y, w, h) => { g.fillStyle = color; g.fillRect(x, y, w, h); };
+  const floorY = CONFIG.room.floorY;
+
+  box('#1f1c30', 0, 0, W, floorY);
+  for (let x = 0; x < W; x += 16) box('#232036', x, 0, 8, floorY);
+  box('#191728', 0, 0, W, 14);
+  box('#2c2842', 0, floorY - 6, W, 6);
+
+  // 窗戶與月亮
+  box('#37324f', 42, 34, 46, 50);
+  box('#121a33', 45, 37, 40, 44);
+  box('#d9d6c0', 70, 43, 9, 9);
+  box('#121a33', 70, 43, 2, 2);
+  box('#121a33', 77, 50, 2, 2);
+  box('#121a33', 67, 41, 6, 6);
+  [[50, 44], [58, 62], [76, 68], [52, 72], [64, 40]].forEach(([x, y]) => box('#8a8fb0', x, y, 1, 1));
+  box('#37324f', 64, 37, 2, 44);
+  box('#37324f', 45, 58, 40, 2);
+
+  // 魚的海報
+  box('#37324f', 236, 34, 36, 44);
+  box('#292542', 238, 36, 32, 40);
+  box('#5b7fa0', 245, 52, 14, 8);
+  box('#5b7fa0', 241, 50, 4, 3);
+  box('#5b7fa0', 241, 59, 4, 3);
+  box('#5b7fa0', 243, 53, 3, 6);
+  box('#14121f', 255, 54, 2, 2);
+
+  // 吊燈
+  box('#37324f', 159, 14, 2, 28);
+  box('#4a4464', 153, 42, 14, 5);
+  box('#f0dfa0', 157, 47, 6, 2);
+
+  // 地板
+  box('#3a3350', 0, floorY, W, 2);
+  box('#17141f', 0, floorY + 2, W, H - floorY - 2);
+  for (let x = 12; x < W; x += 44) box('#211d2e', x, floorY + 2, 1, H - floorY - 2);
+  for (let x = 34; x < W; x += 44) box('#1c1928', x, floorY + 10, 1, H - floorY - 10);
+
+  // 架子
+  CONFIG.room.shelves.forEach((s) => {
+    const w = s.x1 - s.x0;
+    box('#5a4d70', s.x0, s.y, w, 1);
+    box('#43395a', s.x0, s.y + 1, w, 2);
+    box('#2c2640', s.x0, s.y + 3, w, 1);
+    box('#2c2640', s.x0 + 6, s.y + 4, 2, 5);
+    box('#2c2640', s.x1 - 8, s.y + 4, 2, 5);
+  });
+  return c;
+})();
+
+/* ---------- 遊戲狀態 ---------- */
+const game = {
+  state: 'title', // title | playing | over
+  elapsed: 0,
+  score: 0,
+  combo: 0,
+  comboTimer: 0,
+  maxCombo: 0,
+  boxesEntered: 0,
+  squishes: 0,
+  nextSpawn: 0,
+  clock: 0,
+  restartLockUntil: 0,
+};
+
+let boxes = [];
+let particles = [];
+let popups = [];
+let glitchFrames = 0;
+let glitchShift = 0;
+let shakeTimer = 0;
+
+const cat = {
+  x: W / 2, y: CONFIG.room.floorY, vx: 0, vy: 0,
+  facing: 0, // SPRITES 的索引：0 朝右、1 朝左
+  grounded: true, surface: floorSurface, lastSurface: floorSurface,
+  coyote: 0, jumpBuffer: 0, dropTimer: 0, dropFrom: null,
+  landSquash: 0, runDistance: 0,
+  mode: 'free', // free | hiding
+  box: null, t: 0, startX: 0,
+};
+
+function resetCat() {
+  Object.assign(cat, {
+    x: W / 2, y: CONFIG.room.floorY, vx: 0, vy: 0, facing: 0,
+    grounded: true, surface: floorSurface, lastSurface: floorSurface,
+    coyote: 0, jumpBuffer: 0, dropTimer: 0, dropFrom: null,
+    landSquash: 0, mode: 'free', box: null, t: 0,
+  });
+}
+
+/* ---------- 輸入 ---------- */
+const CODE_MAP = {
+  ArrowLeft: 'left', KeyA: 'left',
+  ArrowRight: 'right', KeyD: 'right',
+  ArrowUp: 'jump', KeyW: 'jump', Space: 'jump',
+  ArrowDown: 'down', KeyS: 'down',
+};
+const held = { left: false, right: false, jump: false, down: false };
+let jumpQueued = false;
+let tapGoal = null;
+
+window.addEventListener('keydown', (e) => {
+  const onButton = e.target instanceof HTMLButtonElement;
+  if (e.code === 'KeyM' && !e.repeat) {
+    setSound(!audio.on);
+    return;
+  }
+  if (game.state !== 'playing') {
+    if ((e.code === 'Space' || e.code === 'Enter') && !e.repeat && !onButton) {
+      e.preventDefault();
+      startGame();
+    } else if (e.code in CODE_MAP && !onButton) {
+      e.preventDefault();
+    }
+    return;
+  }
+  const action = CODE_MAP[e.code];
+  if (!action) return;
+  e.preventDefault();
+  if (onButton) e.target.blur(); // 遊戲中按鍵不該去觸發按鈕
+  held[action] = true;
+  tapGoal = null;
+  if (action === 'jump' && !e.repeat) jumpQueued = true;
+});
+
+window.addEventListener('keyup', (e) => {
+  const action = CODE_MAP[e.code];
+  if (action) held[action] = false;
+});
+
+function releaseAllInput() {
+  held.left = held.right = held.jump = held.down = false;
+  jumpQueued = false;
+  tapGoal = null;
+}
+window.addEventListener('blur', releaseAllInput);
+
+function pointerToRoom(e) {
+  const rect = canvas.getBoundingClientRect();
+  return {
+    x: ((e.clientX - rect.left) / rect.width) * W,
+    y: ((e.clientY - rect.top) / rect.height) * H,
+  };
+}
+
+function surfaceUnder(x, y) {
+  let best = floorSurface;
+  for (const s of surfaces) {
+    if (s !== floorSurface && x >= s.x0 - 8 && x <= s.x1 + 8 && s.y >= y - 4 && s.y < best.y) best = s;
+  }
+  return best;
+}
+
+function setTapGoal(e) {
+  if (game.state !== 'playing') return;
+  const p = pointerToRoom(e);
+  const hit = boxes.find((b) => b.state === 'live'
+    && Math.abs(p.x - b.x) <= b.type.w / 2 + 8
+    && p.y >= b.surface.y - b.type.h - 10
+    && p.y <= b.surface.y + 6);
+  if (hit) {
+    tapGoal = { x: hit.x, surface: hit.surface };
+    return;
+  }
+  const surface = surfaceUnder(p.x, p.y);
+  tapGoal = { x: clamp(p.x, surface.x0 + 8, surface.x1 - 8), surface };
+}
+
+canvas.addEventListener('pointerdown', (e) => {
+  e.preventDefault();
+  if (canvas.setPointerCapture) canvas.setPointerCapture(e.pointerId);
+  setTapGoal(e);
+});
+canvas.addEventListener('pointermove', (e) => {
+  if (e.buttons || e.pressure > 0) setTapGoal(e);
+});
+
+/* 點畫面時的自動尋路：一次只處理「下一層」，靠單向平台走完。 */
+function autopilotInput() {
+  const input = { dir: 0, jump: false, drop: false };
+  if (!tapGoal) return input;
+  const from = cat.grounded ? cat.surface : cat.lastSurface;
+  const to = tapGoal.surface;
+  let goal = tapGoal.x;
+
+  if (from === to) {
+    if (cat.grounded && Math.abs(cat.x - goal) < 5) {
+      tapGoal = null;
+      return input;
+    }
+  } else if (to.level > from.level) {
+    let next = to;
+    if (to.level - from.level > 1) {
+      const candidates = surfaces.filter((s) => s.level === from.level + 1);
+      next = candidates.reduce((a, b) => (
+        Math.abs((a.x0 + a.x1) / 2 - cat.x) <= Math.abs((b.x0 + b.x1) / 2 - cat.x) ? a : b));
+    }
+    goal = clamp(cat.x, next.x0 + 10, next.x1 - 10);
+    const gap = cat.x < next.x0 ? next.x0 - cat.x : cat.x > next.x1 ? cat.x - next.x1 : 0;
+    if (gap <= 14) input.jump = true;
+  } else if (to.level < from.level) {
+    goal = clamp(tapGoal.x, to.x0 + 8, to.x1 - 8);
+    if (cat.x >= to.x0 && cat.x <= to.x1) input.drop = true;
+  } else {
+    // 同高度的另一個架子：先下到地板，再重新規劃
+    input.drop = true;
+  }
+
+  const dx = goal - cat.x;
+  if (Math.abs(dx) > 2) input.dir = Math.sign(dx);
+  return input;
+}
+
+/* ---------- 流程 ---------- */
+function startGame() {
+  if (game.state === 'playing' || performance.now() < game.restartLockUntil) return;
+  Object.assign(game, {
+    state: 'playing', elapsed: 0, score: 0, combo: 0, comboTimer: 0, maxCombo: 0,
+    boxesEntered: 0, squishes: 0, nextSpawn: CONFIG.spawn.firstDelay,
+  });
+  boxes = [];
+  particles = [];
+  popups = [];
+  ui.popups.textContent = '';
+  releaseAllInput();
+  resetCat();
+  ui.overlay.hidden = true;
+  if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+  blip(520, 0.08);
+  blip(780, 0.1, 'square', 0, 0.08);
+}
+
+function loadBest() {
+  try {
+    return Number(localStorage.getItem(BEST_KEY)) || 0;
+  } catch (err) {
+    return 0;
+  }
+}
+
+function saveBest(value) {
+  try {
+    localStorage.setItem(BEST_KEY, String(value));
+  } catch (err) {
+    // 私密瀏覽等情況存不了，略過即可
+  }
+}
+
+function endRound() {
+  game.state = 'over';
+  game.comboTimer = 0;
+  game.restartLockUntil = performance.now() + 600;
+  releaseAllInput();
+  boxes.forEach((b) => {
+    if (b.state === 'live') killBox(b);
+  });
+
+  const best = loadBest();
+  const isNewBest = game.score > best;
+  if (isNewBest) saveBest(game.score);
+  ui.finalScore.textContent = String(game.score);
+  ui.finalStats.textContent = `鑽了 ${game.boxesEntered} 箱・硬塞 ${game.squishes} 次・最大 combo ${game.maxCombo}・`
+    + (isNewBest && game.score > 0 ? '新紀錄！' : `最高 ${Math.max(best, game.score)}`);
+  ui.titlePanel.hidden = true;
+  ui.resultPanel.hidden = false;
+  ui.overlay.hidden = false;
+  blip(660, 0.1);
+  blip(520, 0.1, 'square', 0, 0.1);
+  blip(390, 0.2, 'square', 0, 0.2);
+}
+
+/* ---------- 箱子 ---------- */
+function makeBox(type, surface, x, life) {
+  return { type, surface, x, life, maxLife: life, age: 0, state: 'live', dieT: 0, folded: false };
+}
+
+function pickBoxType() {
+  const total = CONFIG.boxes.reduce((sum, t) => sum + t.weight, 0);
+  let roll = Math.random() * total;
+  for (const t of CONFIG.boxes) {
+    roll -= t.weight;
+    if (roll <= 0) return t;
+  }
+  return CONFIG.boxes[0];
+}
+
+function pickSurface() {
+  const total = surfaces.reduce((sum, s) => sum + (s.x1 - s.x0), 0);
+  let roll = Math.random() * total;
+  for (const s of surfaces) {
+    roll -= s.x1 - s.x0;
+    if (roll <= 0) return s;
+  }
+  return floorSurface;
+}
+
+function trySpawnBox(lifetime) {
+  const sp = CONFIG.spawn;
+  for (let attempt = 0; attempt < 14; attempt++) {
+    const type = pickBoxType();
+    const surface = pickSurface();
+    const margin = type.w / 2 + 4;
+    const x = Math.round(rand(surface.x0 + margin, surface.x1 - margin));
+    const footToCat = Math.hypot(x - cat.x, surface.y - cat.y);
+    if (footToCat < sp.minCatDistance) continue;
+    const blocked = boxes.some((b) => b.surface === surface
+      && Math.abs(b.x - x) < (b.type.w + type.w) / 2 + sp.gap);
+    if (blocked) continue;
+    const box = makeBox(type, surface, x, lifetime * type.lifeScale);
+    boxes.push(box);
+    addDust(x, surface.y, 4, '#7d6a58');
+    blip(240, 0.04, 'triangle');
+    return true;
+  }
+  return false;
+}
+
+function killBox(b) {
+  b.state = 'dying';
+  b.dieT = 0;
+  addDust(b.x, b.surface.y, b.folded ? 4 : 8, '#8a7560');
+}
+
+function difficulty() {
+  return Math.pow(clamp(game.elapsed / CONFIG.roundSeconds, 0, 1), CONFIG.spawn.curve);
+}
+
+function updateSpawner(dt) {
+  game.nextSpawn -= dt;
+  if (game.nextSpawn > 0) return;
+  const sp = CONFIG.spawn;
+  const d = difficulty();
+  const live = boxes.filter((b) => b.state === 'live').length;
+  if (live >= sp.maxBoxes || !trySpawnBox(lerp(sp.lifetimeStart, sp.lifetimeEnd, d))) {
+    game.nextSpawn = 0.1;
+    return;
+  }
+  game.nextSpawn = lerp(sp.intervalStart, sp.intervalEnd, d) * rand(1 - sp.jitter, 1 + sp.jitter);
+}
+
+function updateBoxes(dt) {
+  for (const b of boxes) {
+    b.age += dt;
+    if (b.state === 'live') {
+      b.life -= dt;
+      if (b.life <= 0) {
+        killBox(b);
+        blip(150, 0.08, 'triangle');
+      }
+    } else if (b.state === 'dying') {
+      b.dieT += dt;
+    }
+  }
+  boxes = boxes.filter((b) => !(b.state === 'dying' && b.dieT >= 0.18));
+}
+
+/* ---------- 鑽箱子 ---------- */
+function enterBox(b) {
+  const c = CONFIG.combo;
+  game.combo = game.comboTimer > 0 ? game.combo + 1 : 1;
+  game.comboTimer = c.windowSeconds;
+  game.maxCombo = Math.max(game.maxCombo, game.combo);
+  const multiplier = Math.min(c.maxMultiplier, 1 + (game.combo - 1) * c.bonusPerStep);
+  const gain = Math.round(b.type.points * multiplier);
+  game.score += gain;
+  game.boxesEntered += 1;
+
+  b.state = 'occupied';
+  cat.mode = 'hiding';
+  cat.box = b;
+  cat.t = 0;
+  cat.startX = cat.x;
+  cat.vx = 0;
+  cat.vy = 0;
+  cat.grounded = false;
+  cat.surface = null;
+  tapGoal = null;
+
+  const label = game.combo > 1 ? `+${gain} x${multiplier.toFixed(2).replace(/\.?0+$/, '')}` : `+${gain}`;
+  addPopup(label, b.x, b.surface.y - b.type.h - 18, b.type.squish ? '#ff9ecb' : '#62f3cd');
+  const isBig = b.type.squish || game.combo >= CONFIG.glitch.bigComboFrom;
+  triggerGlitch(isBig ? CONFIG.glitch.bigRgbShift : CONFIG.glitch.rgbShift);
+
+  if (b.type.squish) {
+    game.squishes += 1;
+    shakeTimer = CONFIG.shake.squishSeconds;
+    showSquishLine(b);
+    blip(420, 0.16, 'sawtooth', 110);
+  } else {
+    blip(520 + Math.min(game.combo, 12) * 30, 0.06);
+    blip(780 + Math.min(game.combo, 12) * 30, 0.08, 'square', 0, 0.06);
+  }
+  for (let i = 0; i < 3; i++) {
+    particles.push({
+      x: b.x + rand(-8, 8), y: b.surface.y - b.type.h - 2,
+      vx: rand(-14, 14), vy: rand(-46, -24), life: rand(0.4, 0.7), heart: true,
+    });
+  }
+}
+
+function showSquishLine(b) {
+  const lines = CONFIG.squishLines;
+  if (!lines.length) return;
+  const el = document.createElement('div');
+  el.className = 'pop';
+  el.textContent = lines[Math.floor(Math.random() * lines.length)];
+  el.style.left = `${clamp((b.x / W) * 100, 12, 88)}%`;
+  el.style.top = `${clamp(((b.surface.y - b.type.h - 40) / H) * 100, 8, 90)}%`;
+  el.addEventListener('animationend', () => el.remove());
+  ui.popups.appendChild(el);
+}
+
+function hideDuration(b) {
+  return b.type.squish ? CONFIG.hide.squishHideSeconds : CONFIG.hide.hideSeconds;
+}
+
+function exitBox() {
+  const b = cat.box;
+  cat.mode = 'free';
+  cat.box = null;
+  cat.x = b.x;
+  cat.y = b.surface.y - b.type.h + boxRim(b.type.h);
+  cat.vy = -CONFIG.hide.popSpeed;
+  cat.lastSurface = b.surface;
+  cat.jumpBuffer = 0;
+  b.folded = true;
+  killBox(b);
+}
+
+function boxRim(h) {
+  return Math.max(3, Math.round(h * 0.18));
+}
+
+/* ---------- 貓的更新 ---------- */
+function readInput() {
+  const input = { dir: 0, jumpHeld: false, drop: false, jumpPressed: false };
+  if (game.state !== 'playing') return input;
+  const auto = autopilotInput();
+  input.dir = (held.right ? 1 : 0) - (held.left ? 1 : 0) || auto.dir;
+  input.jumpHeld = held.jump || auto.jump;
+  input.drop = held.down || auto.drop;
+  input.jumpPressed = jumpQueued || (auto.jump && cat.grounded);
+  jumpQueued = false;
+  return input;
+}
+
+function updateCat(dt) {
+  const c = CONFIG.cat;
+  if (cat.mode === 'hiding') {
+    jumpQueued = false;
+    cat.t += dt;
+    cat.x = lerp(cat.startX, cat.box.x, Math.min(1, cat.t / CONFIG.hide.enterSeconds));
+    if (cat.t >= CONFIG.hide.enterSeconds + hideDuration(cat.box)) exitBox();
+    return;
+  }
+
+  const input = readInput();
+  if (input.dir) cat.facing = input.dir > 0 ? 0 : 1;
+
+  const accel = cat.grounded ? (input.dir ? c.groundAccel : c.friction) : c.airAccel;
+  cat.vx = approach(cat.vx, input.dir * c.runSpeed, accel * dt);
+
+  if (input.jumpPressed) cat.jumpBuffer = c.jumpBufferSeconds;
+  else cat.jumpBuffer = Math.max(0, cat.jumpBuffer - dt);
+  cat.coyote = cat.grounded ? c.coyoteSeconds : Math.max(0, cat.coyote - dt);
+  cat.dropTimer = Math.max(0, cat.dropTimer - dt);
+  cat.landSquash = Math.max(0, cat.landSquash - dt);
+
+  if (cat.jumpBuffer > 0 && cat.coyote > 0) {
+    cat.vy = -c.jumpSpeed;
+    cat.grounded = false;
+    cat.surface = null;
+    cat.coyote = 0;
+    cat.jumpBuffer = 0;
+    addDust(cat.x, cat.y, 3, '#5a5270');
+    blip(330, 0.05, 'square', 520);
+  } else if (cat.grounded && input.drop && cat.surface.level > 0) {
+    cat.dropFrom = cat.surface;
+    cat.dropTimer = 0.18;
+    cat.grounded = false;
+    cat.surface = null;
+    cat.coyote = 0;
+  }
+
+  if (!input.jumpHeld && cat.vy < 0 && cat.jumpCutReady) {
+    cat.vy *= c.jumpCut;
+    cat.jumpCutReady = false;
+  }
+  if (cat.grounded || cat.vy >= 0) cat.jumpCutReady = false;
+  if (cat.vy < 0 && input.jumpHeld) cat.jumpCutReady = true;
+
+  cat.x = clamp(cat.x + cat.vx * dt, 8, W - 8);
+  if (cat.x <= 8 || cat.x >= W - 8) cat.vx = 0;
+  cat.runDistance += Math.abs(cat.vx) * dt;
+
+  if (cat.grounded) {
+    if (cat.x < cat.surface.x0 - 3 || cat.x > cat.surface.x1 + 3) {
+      cat.lastSurface = cat.surface;
+      cat.surface = null;
+      cat.grounded = false;
+    }
+  } else {
+    const prevFeet = cat.y;
+    cat.vy = Math.min(cat.vy + c.gravity * dt, c.maxFallSpeed);
+    cat.y += cat.vy * dt;
+    if (cat.vy >= 0) {
+      for (const s of surfaces) {
+        if (s === cat.dropFrom && cat.dropTimer > 0) continue;
+        if (prevFeet <= s.y && cat.y >= s.y && cat.x >= s.x0 - 3 && cat.x <= s.x1 + 3) {
+          land(s);
+          break;
+        }
+      }
+    }
+  }
+
+  if (cat.grounded) cat.lastSurface = cat.surface;
+
+  if (game.state === 'playing') {
+    const hit = boxes.find((b) => b.state === 'live' && b.age > 0.1 && touchesBox(b));
+    if (hit) enterBox(hit);
+  }
+}
+
+function land(s) {
+  const hard = cat.vy > 120;
+  cat.y = s.y;
+  cat.vy = 0;
+  cat.grounded = true;
+  cat.surface = s;
+  if (hard) {
+    cat.landSquash = 0.08;
+    addDust(cat.x, s.y, 3, '#5a5270');
+  }
+}
+
+function touchesBox(b) {
+  const c = CONFIG.cat;
+  const halfW = c.hitboxHalfWidth + b.type.w / 2 - 1;
+  return Math.abs(cat.x - b.x) < halfW
+    && cat.y > b.surface.y - b.type.h
+    && cat.y - c.hitboxHeight < b.surface.y;
+}
+
+/* ---------- 特效 ---------- */
+function addDust(x, y, count, color) {
+  for (let i = 0; i < count && particles.length < 120; i++) {
+    particles.push({
+      x: x + rand(-6, 6), y: y - 1,
+      vx: rand(-34, 34), vy: rand(-30, -6), life: rand(0.18, 0.36), color,
+    });
+  }
+}
+
+function addPopup(text, x, y, color) {
+  popups.push({ text, x, y, color, t: 0 });
+}
+
+function triggerGlitch(shift) {
+  if (!CONFIG.glitch.enabled || reduceMotion) return;
+  glitchFrames = CONFIG.glitch.frames;
+  glitchShift = shift;
+}
+
+function updateFx(dt) {
+  for (const p of particles) {
+    p.life -= dt;
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    if (!p.heart) p.vy += 120 * dt;
+  }
+  particles = particles.filter((p) => p.life > 0);
+  for (const p of popups) {
+    p.t += dt;
+    p.y -= 16 * dt;
+  }
+  popups = popups.filter((p) => p.t < 0.8);
+  shakeTimer = Math.max(0, shakeTimer - dt);
+}
+
+function update(dt) {
+  game.clock += dt;
+  if (game.state === 'playing') {
+    game.elapsed += dt;
+    if (cat.mode !== 'hiding' && game.comboTimer > 0) {
+      game.comboTimer = Math.max(0, game.comboTimer - dt);
+      if (game.comboTimer === 0) game.combo = 0;
+    }
+    if (game.elapsed >= CONFIG.roundSeconds) endRound();
+    else updateSpawner(dt);
+  }
+  updateBoxes(dt);
+  updateCat(dt);
+  updateFx(dt);
+}
+
+/* ---------- 繪製 ---------- */
+function rect(color, x, y, w, h) {
+  ctx.fillStyle = color;
+  ctx.fillRect(x, y, w, h);
+}
+
+function boxGeometry(b) {
+  let w = b.type.w;
+  let h = b.type.h;
+  let ox = 0;
+  if (b.state === 'dying') {
+    const k = 1 - b.dieT / 0.18;
+    h = Math.max(1, Math.round(h * k));
+    w = Math.round(w + (1 - k) * 4);
+  } else {
+    const k = Math.min(1, b.age / 0.14);
+    h = Math.max(1, Math.round(h * (k + Math.sin(k * Math.PI) * 0.2)));
+  }
+  if (b.state === 'occupied') {
+    const since = cat.t - CONFIG.hide.enterSeconds;
+    if (since >= 0 && since < CONFIG.hide.shakeSeconds) {
+      ox = Math.round(Math.sin(since * 70) * (b.type.squish ? 2 : 1));
+    }
+    if (b.type.squish && since >= 0) w += 2; // 被貓撐開
+  } else if (b.state === 'live' && b.life < CONFIG.spawn.warnSeconds) {
+    ox = Math.sin(game.clock * 48) > 0 ? 1 : 0;
+  }
+  return { x: Math.round(b.x - w / 2) + ox, y: b.surface.y - h, w, h, rim: boxRim(h), ox };
+}
+
+function drawBoxBack(b, r) {
+  rect('#7c5a3a', r.x, r.y, r.w, 1);
+  rect('#9a7349', r.x + 1, r.y + 1, r.w - 2, Math.max(1, r.rim - 1));
+}
+
+function drawBoxFront(b, r) {
+  const faceY = r.y + r.rim;
+  const faceH = r.h - r.rim;
+  if (faceH <= 0) return;
+  const tape = b.type.squish ? '#ff9ecb' : '#dcbb8a';
+  rect('#b98a55', r.x, faceY, r.w, faceH);
+  rect('#d4a871', r.x, faceY, r.w, 1);
+  rect('#8f683f', r.x + r.w - 2, faceY, 2, faceH);
+  rect('#8f683f', r.x, faceY + faceH - 1, r.w, 1);
+  const tapeW = Math.max(2, Math.round(r.w / 6));
+  rect(tape, r.x + Math.round((r.w - tapeW) / 2), faceY, tapeW, Math.ceil(faceH * 0.45));
+  // 左右的箱蓋
+  if (r.h > 6) {
+    rect('#a37a4b', r.x - 2, r.y + 1, 2, 2);
+    rect('#a37a4b', r.x + r.w, r.y + 1, 2, 2);
+  }
+}
+
+function drawLifeBar(b, r) {
+  if (b.state !== 'live' || !Number.isFinite(b.maxLife)) return;
+  const ratio = clamp(b.life / b.maxLife, 0, 1);
+  const color = ratio > 0.5 ? '#62f3cd' : ratio > 0.25 ? '#f2c14e' : '#ff7a90';
+  rect('#14121f', r.x, r.y - 4, r.w, 2);
+  rect(color, r.x, r.y - 4, Math.max(1, Math.round(r.w * ratio)), 2);
+}
+
+function drawCatInBox(b, r) {
+  const k = Math.min(1, cat.t / CONFIG.hide.enterSeconds);
+  const rim = r.y + r.rim;
+  const since = cat.t - CONFIG.hide.enterSeconds;
+  const twitch = since > 0.12 && since < 0.2 ? 1 : 0; // 耳朵動一下
+  const top = Math.round(lerp(rim - 16, rim - 5, k * k)) - twitch;
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(0, 0, W, rim);
+  ctx.clip();
+  ctx.drawImage(SPRITES.sit, Math.round(cat.x - 8) + r.ox, top);
+  ctx.restore();
+}
+
+function drawCatSquish(b, r) {
+  const k = Math.min(1, cat.t / CONFIG.hide.enterSeconds);
+  const rim = r.y + r.rim;
+  const baseY = rim + 1;
+  if (k < 1) {
+    const w = Math.round(lerp(16, 20, k));
+    const h = Math.round(lerp(16, 10, k));
+    ctx.drawImage(SPRITES.sit, Math.round(cat.x - w / 2), baseY - h, w, h);
+    return;
+  }
+  const wobble = Math.sin(cat.t * 26);
+  const w = 18 + (wobble > 0.4 ? 2 : 0);
+  const h = 11 - (wobble > 0.4 ? 1 : 0);
+  const sprite = cat.t % 0.5 > 0.42 ? SPRITES.blobBlink : SPRITES.blob;
+  ctx.drawImage(sprite, Math.round(b.x - w / 2) + r.ox, baseY - h, w, h);
+}
+
+function currentCatSprite() {
+  if (!cat.grounded) return cat.vy < 0 ? SPRITES.jump : SPRITES.fall;
+  if (Math.abs(cat.vx) > 12) return Math.floor(cat.runDistance / 12) % 2 ? SPRITES.walk2 : SPRITES.walk1;
+  if (game.clock % 3.4 < 0.12) return SPRITES.blink;
+  return game.clock % 1.2 < 0.6 ? SPRITES.idle : SPRITES.idle2;
+}
+
+function drawFreeCat() {
+  const sprite = currentCatSprite()[cat.facing];
+  const x = Math.round(cat.x);
+  const y = Math.round(cat.y);
+  if (cat.landSquash > 0) {
+    ctx.drawImage(sprite, x - 9, y - 14, 18, 14);
+  } else {
+    ctx.drawImage(sprite, x - 8, y - 16);
+  }
+}
+
+function drawHud() {
+  const sec = Math.ceil(clamp(CONFIG.roundSeconds - game.elapsed, 0, CONFIG.roundSeconds));
+  const timeText = String(sec);
+  const hurry = sec <= 10;
+
+  drawText('SCORE', 5, 3, '#8d86a6');
+  drawText(String(game.score), 27, 2, '#ece8f4', 2);
+  drawText(timeText, Math.round((W - textWidth(timeText, 2)) / 2), 2, hurry ? '#f2c14e' : '#ece8f4', 2);
+
+  if (game.combo >= 2) {
+    const label = `COMBO x${game.combo}`;
+    drawText(label, W - 5 - textWidth(label), 3, '#ff9ecb');
+    const barW = textWidth(label);
+    const ratio = game.comboTimer / CONFIG.combo.windowSeconds;
+    rect('#2c2842', W - 5 - barW, 10, barW, 1);
+    rect('#ff9ecb', W - 5 - barW, 10, Math.round(barW * ratio), 1);
+  }
+  const progress = clamp(game.elapsed / CONFIG.roundSeconds, 0, 1);
+  rect('#2c2842', 0, 13, W, 1);
+  rect(hurry ? '#f2c14e' : '#62f3cd', 0, 13, Math.round(W * (1 - progress)), 1);
+}
+
+function applyGlitch() {
+  const image = ctx.getImageData(0, 0, W, H);
+  const src = image.data;
+  const dst = new Uint8ClampedArray(src);
+  const strength = CONFIG.glitch.strength;
+  for (let y = 0; y < H; y++) {
+    const rowStart = y * W * 4;
+    for (let x = 0; x < W; x++) {
+      const i = rowStart + x * 4;
+      dst[i] = lerp(src[i], src[rowStart + ((x - glitchShift + W) % W) * 4], strength);
+      dst[i + 2] = lerp(src[i + 2], src[rowStart + ((x + glitchShift) % W) * 4 + 2], strength);
+    }
+  }
+  const bandSrc = new Uint8ClampedArray(dst);
+  for (let n = 0; n < CONFIG.glitch.bands; n++) {
+    const y0 = Math.floor(rand(14, H - 6));
+    const height = Math.floor(rand(2, 6));
+    const dx = (Math.random() < 0.5 ? -1 : 1) * CONFIG.glitch.bandShift;
+    for (let y = y0; y < y0 + height && y < H; y++) {
+      const rowStart = y * W * 4;
+      for (let x = 0; x < W; x++) {
+        const from = rowStart + ((x + dx + W) % W) * 4;
+        const to = rowStart + x * 4;
+        dst[to] = bandSrc[from];
+        dst[to + 1] = bandSrc[from + 1];
+        dst[to + 2] = bandSrc[from + 2];
+      }
+    }
+  }
+  image.data.set(dst);
+  ctx.putImageData(image, 0, 0);
+}
+
+function render() {
+  ctx.save();
+  if (shakeTimer > 0 && !reduceMotion) {
+    const a = CONFIG.shake.squishPixels;
+    ctx.translate(Math.round(rand(-a, a)), Math.round(rand(-a, a)));
+  }
+  ctx.drawImage(background, 0, 0);
+
+  for (const b of boxes) {
+    const r = boxGeometry(b);
+    const isHiding = cat.mode === 'hiding' && cat.box === b;
+    drawBoxBack(b, r);
+    if (isHiding && !b.type.squish) drawCatInBox(b, r);
+    drawBoxFront(b, r);
+    if (isHiding && b.type.squish) drawCatSquish(b, r);
+    drawLifeBar(b, r);
+  }
+
+  if (cat.mode === 'free') drawFreeCat();
+
+  for (const p of particles) {
+    if (p.heart) ctx.drawImage(SPRITES.heart, Math.round(p.x), Math.round(p.y));
+    else rect(p.color, Math.round(p.x), Math.round(p.y), 1, 1);
+  }
+  for (const p of popups) {
+    const x = clamp(Math.round(p.x - textWidth(p.text) / 2), 2, W - textWidth(p.text) - 2);
+    drawText(p.text, x, Math.max(16, Math.round(p.y)), p.color);
+  }
+  ctx.restore();
+
+  if (glitchFrames > 0) {
+    applyGlitch();
+    glitchFrames -= 1;
+  }
+
+  if (game.state !== 'title') drawHud(); // HUD 畫在 glitch 之後，高對比的白字才不會閃出色塊
+}
+
+/* ---------- 音效（預設靜音） ---------- */
+const audio = { ctx: null, on: false };
+
+function setSound(on) {
+  audio.on = on;
+  if (on) {
+    const AudioCtor = window.AudioContext || window.webkitAudioContext;
+    if (!audio.ctx && AudioCtor) audio.ctx = new AudioCtor();
+    if (audio.ctx && audio.ctx.state === 'suspended') audio.ctx.resume();
+    blip(880, 0.06);
+  }
+  ui.sound.textContent = on ? '音效：開' : '音效：關';
+  ui.sound.setAttribute('aria-pressed', String(on));
+}
+
+function blip(freq, duration = 0.07, type = 'square', slideTo = 0, delay = 0) {
+  if (!audio.on || !audio.ctx) return;
+  const ac = audio.ctx;
+  const start = ac.currentTime + delay;
+  const osc = ac.createOscillator();
+  const gain = ac.createGain();
+  osc.type = type;
+  osc.frequency.setValueAtTime(freq, start);
+  if (slideTo) osc.frequency.exponentialRampToValueAtTime(slideTo, start + duration);
+  gain.gain.setValueAtTime(CONFIG.audio.volume, start);
+  gain.gain.exponentialRampToValueAtTime(0.0001, start + duration);
+  osc.connect(gain);
+  gain.connect(ac.destination);
+  osc.start(start);
+  osc.stop(start + duration + 0.02);
+}
+
+/* ---------- 版面與主迴圈 ---------- */
+function fitStage() {
+  let scale = Math.min(window.innerWidth / W, window.innerHeight / H);
+  if (scale >= CONFIG.view.integerScaleFrom) scale = Math.floor(scale);
+  stage.style.width = `${Math.floor(W * scale)}px`;
+  stage.style.height = `${Math.floor(H * scale)}px`;
+  document.documentElement.style.setProperty('--u', `${scale}px`);
+}
+
+window.addEventListener('resize', fitStage);
+fitStage();
+
+document.getElementById('start').addEventListener('click', startGame);
+document.getElementById('again').addEventListener('click', startGame);
+ui.sound.addEventListener('click', () => {
+  setSound(!audio.on);
+  ui.sound.blur(); // 避免之後按空白鍵又切換音效
+});
+
+boxes.push(makeBox(CONFIG.boxes[0], floorSurface, W / 2 + 46, Infinity));
+
+let lastTime = performance.now();
+let accumulator = 0;
+
+function frame(now) {
+  accumulator += Math.min(0.1, Math.max(0, (now - lastTime) / 1000));
+  lastTime = now;
+  while (accumulator >= STEP) {
+    update(STEP);
+    accumulator -= STEP;
+  }
+  render();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
